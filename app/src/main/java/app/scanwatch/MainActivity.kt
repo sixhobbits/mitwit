@@ -52,19 +52,25 @@ class MainActivity : Activity() {
         root.addView(content)
         setContentView(ScrollView(this).apply { addView(root) })
         render()
+        // `adb shell am start -n app.scanwatch/.MainActivity --ez sync true` starts a sync.
+        if (intent.getBooleanExtra("sync", false)) startSync()
     }
 
     private fun startSync() {
-        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
+        val perms = arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
+        if (perms.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+            requestPermissions(perms, 1)
             return
         }
         syncButton.isEnabled = false
         logLines.clear()
         Thread {
-            val log: (String) -> Unit = { s -> main.post { logLines.add(s); status.text = s } }
+            val log: (String) -> Unit = { s ->
+                android.util.Log.i("ScanWatchLocal", s)
+                main.post { logLines.add(s); status.text = s }
+            }
             try {
-                Sync(WatchClient(this, log), store, log).run(BuildConfig.WATCH_SECRET)
+                Sync(WatchClient(this, log), store, log).run(BuildConfig.WATCH_ADDRESS, BuildConfig.WATCH_SECRET)
             } catch (e: Exception) {
                 log("Sync failed: ${e.message}")
             }
@@ -73,7 +79,7 @@ class MainActivity : Activity() {
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
-        if (results.firstOrNull() == PackageManager.PERMISSION_GRANTED) startSync()
+        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) startSync()
     }
 
     private fun render() {

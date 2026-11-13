@@ -8,6 +8,10 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import java.nio.ByteBuffer
 import java.security.MessageDigest
@@ -19,11 +23,12 @@ import java.util.concurrent.TimeUnit
 class WatchException(msg: String) : Exception(msg)
 
 /**
- * Talks WPP to an already-bonded ScanWatch over BLE. Blocking API: call from a worker thread.
+ * Talks WPP to a ScanWatch over BLE. Blocking API: call from a worker thread.
  *
- * Link setup mirrors the Withings app's bonded path: the service whose UUID contains
- * "5749-5448" ("WITH"), the characteristic whose UUID has '4' at index 7, MTU 512,
- * notifications on that same characteristic, and writes without response in MTU-3 chunks.
+ * Link setup mirrors the Withings app: the service whose UUID contains "5749-5448"
+ * ("WITH"), the characteristic whose UUID has the index digit at position 7 (4 when
+ * bonded, 3 when not), MTU 512, notifications on that same characteristic, and writes
+ * without response in MTU-3 chunks.
  */
 @SuppressLint("MissingPermission")
 class WatchClient(private val context: Context, private val log: (String) -> Unit) {
@@ -86,18 +91,14 @@ class WatchClient(private val context: Context, private val log: (String) -> Uni
         }
     }
 
-    fun findWatch(): BluetoothDevice {
+    fun connect(address: String, advKey: String) {
         val adapter = context.getSystemService(BluetoothManager::class.java).adapter
             ?: throw WatchException("No Bluetooth adapter")
         if (!adapter.isEnabled) throw WatchException("Bluetooth is off")
-        return adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("ScanWatch", ignoreCase = true) }
-            ?: throw WatchException("No bonded ScanWatch found in Bluetooth settings")
-    }
-
-    fun connect() {
-        val device = findWatch()
-        deviceName = device.name ?: device.address
-        log("Connecting to $deviceName (${device.address})")
+        val device = scan(adapter, address.uppercase(), advKey)
+        val bonded = device.bondState == BluetoothDevice.BOND_BONDED
+        deviceName = address
+        log("Connecting to ${device.address} (${if (bonded) "bonded" else "not bonded"})")
         val g = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         gatt = g
         val st = await<Ev.State>("connection", 30000)
@@ -107,8 +108,10 @@ class WatchClient(private val context: Context, private val log: (String) -> Uni
         await<Ev.Services>("service discovery")
         val service = g.services.firstOrNull { it.uuid.toString().contains("5749-5448", ignoreCase = true) }
             ?: throw WatchException("Withings service not found; services: ${g.services.map { it.uuid }}")
-        val c = service.characteristics.firstOrNull { it.uuid.toString()[7] == '4' }
-            ?: throw WatchException("Characteristic 4 not found; have: ${service.characteristics.map { it.uuid }}")
+        // Bonded (encrypted) links use characteristic 4, unbonded ones characteristic 3.
+        val index = if (bonded) '4' else '3'
+        val c = service.characteristics.firstOrNull { it.uuid.toString()[7] == index }
+            ?: throw WatchException("Characteristic $index not found; have: ${service.characteristics.map { it.uuid }}")
         ch = c
         log("Using ${c.uuid}")
 
@@ -121,6 +124,36 @@ class WatchClient(private val context: Context, private val log: (String) -> Uni
             ?: throw WatchException("No notification descriptor")
         g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
         await<Ev.DescWrite>("enabling notifications")
+    }
+
+    /**
+     * The watch advertises from a random address, so it is recognised by the identity in
+     * its 0xFD77 service data: a 2-byte salt and a 2-byte hash of the advertise key
+     * (the Withings app sets it to the same value as the association secret).
+     */
+    private fun scan(adapter: android.bluetooth.BluetoothAdapter, address: String, advKey: String): BluetoothDevice {
+        val found = LinkedBlockingQueue<BluetoothDevice>()
+        val cb = object : ScanCallback() {
+            override fun onScanResult(type: Int, result: ScanResult) {
+                val data = result.scanRecord?.getServiceData(FD77) ?: ByteArray(0)
+                if (result.device.address == address || identityMatches(data, advKey.toByteArray())) {
+                    found.offer(result.device)
+                }
+            }
+        }
+        val filters = listOf(
+            ScanFilter.Builder().setServiceData(FD77, ByteArray(0)).build(),
+            ScanFilter.Builder().setDeviceAddress(address).build(),
+        )
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        log("Looking for the watch…")
+        adapter.bluetoothLeScanner.startScan(filters, settings, cb)
+        try {
+            return found.poll(SCAN_SECONDS, TimeUnit.SECONDS)
+                ?: throw WatchException("Watch not found nearby within $SCAN_SECONDS s")
+        } finally {
+            adapter.bluetoothLeScanner.stopScan(cb)
+        }
     }
 
     fun disconnect() {
@@ -211,4 +244,34 @@ class WatchClient(private val context: Context, private val log: (String) -> Uni
 
         request(Frame(Cmd.INITIAL_CONNECT))
     }
+
+    companion object {
+        const val SCAN_SECONDS = 60L
+        val FD77: android.os.ParcelUuid = android.os.ParcelUuid.fromString("0000FD77-0000-1000-8000-00805F9B34FB")
+    }
+}
+
+/**
+ * FD77 service data: 2-byte header (version, model), then entries with a 1-byte header
+ * (type in the high nibble, length in the low nibble). Type 3 = identity {salt[2], hash[2]},
+ * where hash = SHA1(key XOR repeated salt) folded by XOR into 2 bytes.
+ */
+internal fun identityMatches(data: ByteArray, key: ByteArray): Boolean {
+    var i = 2
+    while (i < data.size) {
+        val type = (data[i].toInt() ushr 4) and 0xF
+        val len = data[i].toInt() and 0xF
+        if (i + 1 + len > data.size) return false
+        if (type == 3 && len == 4) {
+            val salt = data.copyOfRange(i + 1, i + 3)
+            val want = data.copyOfRange(i + 3, i + 5)
+            val mixed = ByteArray(key.size) { (key[it].toInt() xor salt[it % salt.size].toInt()).toByte() }
+            val d = MessageDigest.getInstance("SHA1").digest(mixed)
+            val out = d.copyOf(want.size)
+            for (j in want.size until d.size) out[j % want.size] = (out[j % want.size].toInt() xor d[j].toInt()).toByte()
+            return out.contentEquals(want)
+        }
+        i += 1 + len
+    }
+    return false
 }

@@ -4,7 +4,9 @@ plugins {
     id("com.android.application")
 }
 
-// The watch's association secret (klSecret) lives outside git, in secrets.properties:
+// The watch's Bluetooth address and association secret (klSecret) live outside git,
+// in secrets.properties:
+//   watchAddress=AA:BB:CC:DD:EE:FF
 //   watchSecret=...
 val secrets = Properties().apply {
     val f = rootProject.file("secrets.properties")
@@ -22,6 +24,7 @@ android {
         versionCode = 1
         versionName = "0.1"
         buildConfigField("String", "WATCH_SECRET", "\"${secrets.getProperty("watchSecret", "")}\"")
+        buildConfigField("String", "WATCH_ADDRESS", "\"${secrets.getProperty("watchAddress", "")}\"")
     }
 
     buildFeatures {

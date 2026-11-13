@@ -13,9 +13,9 @@ import java.nio.ByteBuffer
  */
 class Sync(private val client: WatchClient, private val store: Store, private val log: (String) -> Unit) {
 
-    fun run(secret: String) {
-        if (secret.isEmpty()) throw WatchException("No watch secret configured (secrets.properties)")
-        client.connect()
+    fun run(address: String, secret: String) {
+        if (secret.isEmpty() || address.isEmpty()) throw WatchException("Watch address/secret missing (secrets.properties)")
+        client.connect(address, secret)
         try {
             client.authenticate(secret)
 
