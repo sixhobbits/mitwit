@@ -2,58 +2,222 @@ package app.scanwatch
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.widget.Button
+import android.view.GestureDetector
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.WindowInsets
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Date
-import java.util.Locale
+import java.io.File
+import java.time.Instant
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 
 class MainActivity : Activity() {
-    private lateinit var store: Store
-    private lateinit var content: LinearLayout
-    private lateinit var syncButton: Button
-    private lateinit var status: TextView
-    private val logLines = ArrayList<String>()
+    enum class Tab(val label: String) { ACTIVITY("Activity"), SLEEP("Sleep"), VITALS("Vitals"), WATCH("Watch") }
+
+    private lateinit var db: Db
+    private lateinit var body: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var nav: LinearLayout
+    private lateinit var syncPill: TextView
     private val main = Handler(Looper.getMainLooper())
-    private val time = SimpleDateFormat("EEE HH:mm", Locale.getDefault())
+    private val prefs by lazy { getSharedPreferences("meta", MODE_PRIVATE) }
+
+    private var tab = Tab.ACTIVITY
+    private var period = Period.of(Range.DAY, LocalDate.now())
+    private var busy: String? = null
+    private val logLines = ArrayList<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        store = Store(this)
+        db = Db(this)
+        // Data from version 0.1 (JSON files) is re-read from the watch on the next sync.
+        File(filesDir, "data").deleteRecursively()
 
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val pad = dp(16)
-        root.setPadding(pad, pad, pad, pad)
-        root.setOnApplyWindowInsetsListener { v, insets ->
-            val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars())
-            v.setPadding(pad, pad + bars.top, pad, pad + bars.bottom)
-            insets
-        }
+        intent.getStringExtra("tab")?.let { t -> tab = Tab.valueOf(t.uppercase()) }
+        val range = intent.getStringExtra("range")?.let { Range.valueOf(it.uppercase()) } ?: Range.DAY
+        val date = intent.getStringExtra("date")?.let(LocalDate::parse) ?: LocalDate.now()
+        period = Period.of(range, date)
 
-        syncButton = Button(this).apply {
-            text = "Sync watch"
+        window.decorView.setBackgroundColor(Pal.BG)
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Pal.BG) }
+
+        syncPill = label("Sync", 14f, Pal.TEXT, MEDIUM).apply {
+            background = rounded(Pal.CHIP, dpf(16))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
             setOnClickListener { startSync() }
         }
-        status = TextView(this).apply { setTextColor(Color.GRAY) }
-        content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val header = hrow().apply {
+            setPadding(dp(20), dp(8), dp(16), dp(4))
+            addView(label("ScanWatch", 22f, Pal.TEXT, BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(syncPill)
+        }
+        body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(8), dp(14), dp(24))
+        }
+        scroll = ScrollView(this).apply { addView(body); isVerticalScrollBarEnabled = false }
+        nav = hrow().apply { setBackgroundColor(Pal.CARD) }
 
-        root.addView(syncButton)
-        root.addView(status)
-        root.addView(content)
-        setContentView(ScrollView(this).apply { addView(root) })
+        root.addView(header)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(nav)
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val bars = insets.getInsets(WindowInsets.Type.systemBars())
+            header.setPadding(dp(20), bars.top + dp(8), dp(16), dp(4))
+            nav.setPadding(0, 0, 0, bars.bottom)
+            insets
+        }
+        setContentView(root)
         render()
-        // `adb shell am start -n app.scanwatch/.MainActivity --ez sync true` starts a sync.
+
+        // Test hooks: `--ez sync true` starts a sync, `--es import <path>` imports an export zip.
         if (intent.getBooleanExtra("sync", false)) startSync()
+        intent.getStringExtra("import")?.let { path -> importFrom { File(path).inputStream() } }
+    }
+
+    // ---- Navigation ----
+
+    fun open(p: Period) {
+        period = p
+        render()
+        scroll.scrollTo(0, 0)
+    }
+
+    private val swipe by lazy { gestures() }
+
+    private fun gestures() = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+            if (e1 == null || tab == Tab.WATCH) return false
+            val dx = e2.x - e1.x
+            if (abs(dx) < dp(80) || abs(dx) < abs(e2.y - e1.y) * 2 || abs(vx) < 600) return false
+            if (dx < 0 && period.hasNext) open(period.shift(1)) else if (dx > 0) open(period.shift(-1))
+            return true
+        }
+    })
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        swipe.onTouchEvent(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun render() {
+        renderNav()
+        syncPill.text = busy ?: "Sync"
+        syncPill.alpha = if (busy != null) 0.6f else 1f
+        body.removeAllViews()
+        if (tab == Tab.WATCH) return renderWatch()
+
+        body.addView(segmented(Range.entries.map { it.label }, period.range.ordinal) { i ->
+            open(Period.of(Range.entries[i], period.start.coerceAtMost(LocalDate.now())))
+        })
+        body.addView(hrow().apply {
+            setPadding(0, dp(6), 0, dp(6))
+            addView(arrow("‹", true) { open(period.shift(-1)) })
+            addView(label(period.title(), 17f, Pal.TEXT, MEDIUM).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(arrow("›", period.hasNext) { open(period.shift(1)) })
+        })
+        when (tab) {
+            Tab.ACTIVITY -> ActivityScreen(this, db).build(period, body)
+            Tab.SLEEP -> SleepScreen(this, db).build(period, body)
+            Tab.VITALS -> VitalsScreen(this, db).build(period, body)
+            Tab.WATCH -> {}
+        }
+    }
+
+    private fun arrow(s: String, enabled: Boolean, go: () -> Unit) = label(s, 28f, if (enabled) Pal.TEXT else Pal.GRID).apply {
+        gravity = Gravity.CENTER
+        layoutParams = LinearLayout.LayoutParams(dp(48), dp(44))
+        if (enabled) setOnClickListener { go() }
+    }
+
+    private fun renderNav() {
+        nav.removeAllViews()
+        for (t in Tab.entries) {
+            nav.addView(label(t.label, 13f, if (t == tab) Pal.TEXT else Pal.SUB, MEDIUM).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, dp(10), 0, dp(14))
+                val marker = rounded(if (t == tab) Pal.STEPS else Color.TRANSPARENT, dpf(2)).apply { setSize(dp(28), dp(4)) }
+                setCompoundDrawablesWithIntrinsicBounds(null, marker, null, null)
+                compoundDrawablePadding = dp(8)
+                setOnClickListener { tab = t; render(); scroll.scrollTo(0, 0) }
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+    }
+
+    // ---- Watch tab: sync, import, stored data ----
+
+    private fun renderWatch() {
+        val last = prefs.getString("lastSync", null)?.toLongOrNull()
+        val battery = prefs.getString("battery", null)
+        body.addView(card().apply {
+            addView(label("ScanWatch 2", 20f, Pal.TEXT, BOLD))
+            addView(label(buildList {
+                add(if (last != null) "Last sync ${fmtTime(last)}" else "Never synced")
+                if (battery != null) add("Battery $battery%")
+            }.joinToString(" · "), 14f, Pal.SUB).apply { setPadding(0, dp(2), 0, dp(14)) })
+            addView(button(busy ?: "Sync now", busy == null) { startSync() })
+        })
+        body.addView(card("Import Withings data").apply {
+            addView(label("Pick the data_….zip export from Withings (Settings → Download my data). Re-importing is safe.", 14f, Pal.SUB)
+                .apply { setPadding(0, 0, 0, dp(12)) })
+            addView(button("Choose export file", busy == null) {
+                startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE); type = "application/zip"
+                }, PICK_ZIP)
+            })
+        })
+        if (logLines.isNotEmpty()) body.addView(card("Log").apply {
+            addView(label(logLines.takeLast(40).joinToString("\n"), 12f, Pal.SUB).apply { typeface = Typeface.MONOSPACE })
+        })
+        body.addView(card("Stored on this phone").apply {
+            for ((name, table) in listOf("Steps & distance" to "motion", "Sleep stages" to "sleep_state", "Heart rate" to "hr",
+                "HRV" to "hrv", "Temperature" to "temp", "Respiratory rate" to "rr", "SpO2" to "spo2")) {
+                val (n, range) = db.count(table)
+                addView(statRow(name, if (n == 0L) "none" else "${n.toInt().grouped()} · since ${fmtDate(range[0])}"))
+            }
+            addView(label("No internet permission: nothing leaves this phone.", 13f, Pal.SUB).apply { setPadding(0, dp(10), 0, 0) })
+        })
+    }
+
+    private fun button(s: String, enabled: Boolean, go: () -> Unit) = label(s, 16f, if (enabled) Pal.BG else Pal.SUB, MEDIUM).apply {
+        gravity = Gravity.CENTER
+        setPadding(0, dp(14), 0, dp(14))
+        background = rounded(if (enabled) Pal.STEPS else Pal.CHIP, dpf(14))
+        if (enabled) setOnClickListener { go() }
+    }
+
+    private fun fmtTime(t: Long) = Instant.ofEpochSecond(t).atZone(db.zone).format(DateTimeFormatter.ofPattern("EEE d MMM HH:mm"))
+    private fun fmtDate(t: Long) = Instant.ofEpochSecond(t).atZone(db.zone).format(DateTimeFormatter.ofPattern("d MMM yyyy"))
+
+    private fun log(s: String) {
+        android.util.Log.i("ScanWatchLocal", s)
+        main.post {
+            logLines.add(s)
+            if (busy != null) { busy = s.take(28); syncPill.text = busy }
+        }
+    }
+
+    /** Runs [work] on a worker thread with the sync pill showing progress, then re-renders. */
+    private fun background(title: String, work: () -> Unit) {
+        if (busy != null) return
+        busy = title
+        logLines.clear()
+        render()
+        Thread {
+            try { work() } catch (e: Exception) { log("Failed: ${e.message}") }
+            main.post { busy = null; render() }
+        }.start()
     }
 
     private fun startSync() {
@@ -62,123 +226,30 @@ class MainActivity : Activity() {
             requestPermissions(perms, 1)
             return
         }
-        syncButton.isEnabled = false
-        logLines.clear()
-        Thread {
-            val log: (String) -> Unit = { s ->
-                android.util.Log.i("ScanWatchLocal", s)
-                main.post { logLines.add(s); status.text = s }
-            }
-            try {
-                Sync(WatchClient(this, log), store, log).run(BuildConfig.WATCH_ADDRESS, BuildConfig.WATCH_SECRET)
-            } catch (e: Exception) {
-                log("Sync failed: ${e.message}")
-            }
-            main.post { syncButton.isEnabled = true; render() }
-        }.start()
+        background("Syncing…") {
+            Sync(WatchClient(this, ::log), db, { k, v -> prefs.edit().putString(k, v).apply() }, ::log)
+                .run(BuildConfig.WATCH_ADDRESS, BuildConfig.WATCH_SECRET)
+        }
+    }
+
+    private fun importFrom(open: () -> java.io.InputStream) = background("Importing…") {
+        open().use { Importer(db, ::log).run(it) }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) startSync()
     }
 
-    private fun render() {
-        content.removeAllViews()
-        val now = System.currentTimeMillis() / 1000
-        val dayAgo = now - 86400
-
-        val last = store.meta("lastSync")?.toLongOrNull()
-        val battery = store.meta("battery")
-        val info = buildList {
-            add(if (last != null) "Last sync ${time.format(Date(last * 1000))}" else "Never synced")
-            if (battery != null) add("Battery $battery%")
-        }.joinToString(" · ")
-        content.addView(text(info, 13f, Color.GRAY))
-
-        // Today
-        val midnight = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0)
-        }.timeInMillis / 1000
-        val motion = store.load("motion")
-        val today = motion.tailMap(midnight).values
-        val steps = today.sumOf { it.optInt("steps") }
-        val km = today.sumOf { it.optDouble("dist", 0.0) } / 1000
-        val kcal = today.sumOf { it.optDouble("kcal", 0.0) }
-        header("Today")
-        content.addView(text("%,d steps · %.2f km · %.0f active kcal".format(steps, km, kcal), 18f))
-
-        // Heart rate
-        val hr = store.load("hr").tailMap(dayAgo).values.filter { it.has("bpm") }
-        header("Heart rate (24 h)")
-        if (hr.isNotEmpty()) {
-            val l = hr.last()
-            content.addView(text("${l.getInt("bpm")} bpm at ${time.format(Date(l.getLong("t") * 1000))} · " +
-                "range ${hr.minOf { it.getInt("bpm") }}–${hr.maxOf { it.getInt("bpm") }}", 16f))
-            content.addView(LineChart(this, hr.map { it.getLong("t") to it.getDouble("bpm") }, Color.parseColor("#E53935")))
-        } else content.addView(text("No data", 14f, Color.GRAY))
-
-        // Sleep
-        header("Last sleep")
-        renderSleep(motion.tailMap(now - 30 * 3600).values.filter { it.has("sleep") })
-
-        // Vitals
-        series("Skin temperature (24 h)", "temp", "°C", dayAgo, Color.parseColor("#FB8C00"))
-        series("SpO2 (24 h)", "spo2", "%", dayAgo, Color.parseColor("#1E88E5"))
-        series("HRV RMSSD (7 days)", "rmssd", "ms", now - 7 * 86400, Color.parseColor("#43A047"), kind = "hrv")
-        series("Respiratory rate (7 days)", "rr", "/min", now - 7 * 86400, Color.parseColor("#8E24AA"))
-
-        if (logLines.isNotEmpty()) {
-            header("Sync log")
-            content.addView(text(logLines.joinToString("\n"), 12f, Color.GRAY).apply { typeface = Typeface.MONOSPACE })
+    @Deprecated("Activity result API needs AndroidX; the platform callback is enough here.")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        val uri = data?.data
+        if (requestCode == PICK_ZIP && resultCode == RESULT_OK && uri != null) {
+            tab = Tab.WATCH
+            importFrom { contentResolver.openInputStream(uri)!! }
         }
     }
 
-    private fun renderSleep(records: List<JSONObject>) {
-        if (records.isEmpty()) {
-            content.addView(text("No data", 14f, Color.GRAY)); return
-        }
-        // Take the most recent session: walk back from the end until a gap of more than 2 hours.
-        val session = ArrayList<JSONObject>()
-        for (r in records.reversed()) {
-            if (session.isNotEmpty() && session.last().getLong("t") - r.getLong("t") > 7200) break
-            session.add(r)
-        }
-        session.reverse()
-        val mins = IntArray(4)
-        for (r in session) {
-            val s = r.getInt("sleep")
-            if (s in 0..3) mins[s] += r.getInt("d") / 60
-        }
-        val asleep = mins[1] + mins[2] + mins[3]
-        content.addView(text("%dh %02dm asleep".format(asleep / 60, asleep % 60), 18f))
-        content.addView(text("Deep ${hm(mins[2])} · Light ${hm(mins[1])} · REM ${hm(mins[3])} · Awake ${hm(mins[0])}", 14f))
-        content.addView(Hypnogram(this, session.map { Triple(it.getLong("t"), it.getInt("d"), it.getInt("sleep")) }))
+    companion object {
+        const val PICK_ZIP = 2
     }
-
-    private fun series(title: String, field: String, unit: String, since: Long, color: Int, kind: String = field) {
-        val pts = store.load(kind).tailMap(since).values.filter { it.has(field) }
-            .map { it.getLong("t") to it.getDouble(field) }
-        header(title)
-        if (pts.isEmpty()) {
-            content.addView(text("No data", 14f, Color.GRAY)); return
-        }
-        val (t, v) = pts.last()
-        content.addView(text("Latest %.1f %s at %s".format(v, unit, time.format(Date(t * 1000))), 16f))
-        content.addView(LineChart(this, pts, color))
-    }
-
-    private fun hm(m: Int) = if (m >= 60) "${m / 60}h ${m % 60}m" else "${m}m"
-
-    private fun header(s: String) = content.addView(text(s, 13f, Color.GRAY).apply {
-        typeface = Typeface.DEFAULT_BOLD
-        setPadding(0, dp(20), 0, dp(4))
-    })
-
-    private fun text(s: String, size: Float, color: Int? = null) = TextView(this).apply {
-        text = s
-        textSize = size
-        if (color != null) setTextColor(color)
-    }
-
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 }

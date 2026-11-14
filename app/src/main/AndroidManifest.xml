@@ -10,7 +10,7 @@
     <application
         android:allowBackup="false"
         android:label="ScanWatch Local"
-        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
             android:name=".MainActivity"
             android:exported="true">
