@@ -1,4 +1,7 @@
 secrets.properties
+signing.properties
+*.jks
+*.keystore
 local.properties
 .gradle/
 .kotlin/

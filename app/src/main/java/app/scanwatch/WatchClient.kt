@@ -91,13 +91,12 @@ class WatchClient(private val context: Context, private val log: (String) -> Uni
         }
     }
 
-    fun connect(address: String, advKey: String) {
+    fun connect(advKey: String) {
         val adapter = context.getSystemService(BluetoothManager::class.java).adapter
             ?: throw WatchException("No Bluetooth adapter")
         if (!adapter.isEnabled) throw WatchException("Bluetooth is off")
-        val device = scan(adapter, address.uppercase(), advKey)
+        val device = scan(adapter, advKey)
         val bonded = device.bondState == BluetoothDevice.BOND_BONDED
-        deviceName = address
         log("Connecting to ${device.address} (${if (bonded) "bonded" else "not bonded"})")
         val g = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         gatt = g
@@ -131,20 +130,15 @@ class WatchClient(private val context: Context, private val log: (String) -> Uni
      * its 0xFD77 service data: a 2-byte salt and a 2-byte hash of the advertise key
      * (the Withings app sets it to the same value as the association secret).
      */
-    private fun scan(adapter: android.bluetooth.BluetoothAdapter, address: String, advKey: String): BluetoothDevice {
+    private fun scan(adapter: android.bluetooth.BluetoothAdapter, advKey: String): BluetoothDevice {
         val found = LinkedBlockingQueue<BluetoothDevice>()
         val cb = object : ScanCallback() {
             override fun onScanResult(type: Int, result: ScanResult) {
                 val data = result.scanRecord?.getServiceData(FD77) ?: ByteArray(0)
-                if (result.device.address == address || identityMatches(data, advKey.toByteArray())) {
-                    found.offer(result.device)
-                }
+                if (identityMatches(data, advKey.toByteArray())) found.offer(result.device)
             }
         }
-        val filters = listOf(
-            ScanFilter.Builder().setServiceData(FD77, ByteArray(0)).build(),
-            ScanFilter.Builder().setDeviceAddress(address).build(),
-        )
+        val filters = listOf(ScanFilter.Builder().setServiceData(FD77, ByteArray(0)).build())
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         log("Looking for the watch…")
         adapter.bluetoothLeScanner.startScan(filters, settings, cb)

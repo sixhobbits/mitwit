@@ -166,6 +166,12 @@ class Db(context: Context) : SQLiteOpenHelper(context, "scanwatch.db", null, 1) 
         return out
     }
 
+    fun avg(table: String, col: String, from: LocalDate, toExclusive: LocalDate): Double? =
+        readableDatabase.rawQuery(
+            "SELECT AVG($col) FROM $table WHERE t >= ? AND t < ? AND $col > 0",
+            arrayOf(epoch(from).toString(), epoch(toExclusive).toString()),
+        ).use { if (it.moveToFirst() && !it.isNull(0)) it.getDouble(0) else null }
+
     fun bands(table: String, col: String, from: LocalDate, toExclusive: LocalDate): List<Band> {
         val out = ArrayList<Band>()
         readableDatabase.rawQuery(

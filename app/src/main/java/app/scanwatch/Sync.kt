@@ -21,9 +21,9 @@ class Sync(
         val v = HashMap<String, Number>()
     }
 
-    fun run(address: String, secret: String) {
-        if (secret.isEmpty() || address.isEmpty()) throw WatchException("Watch address/secret missing (secrets.properties)")
-        client.connect(address, secret)
+    fun run(secret: String) {
+        if (secret.isEmpty()) throw WatchException("Enter your watch secret on the Watch tab first")
+        client.connect(secret)
         val since: Long
         try {
             client.authenticate(secret)

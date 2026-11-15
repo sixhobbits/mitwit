@@ -9,7 +9,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="ScanWatch Local"
+        android:label="MitWit"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
             android:name=".MainActivity"

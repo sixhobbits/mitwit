@@ -4,12 +4,13 @@ plugins {
     id("com.android.application")
 }
 
-// The watch's Bluetooth address and association secret (klSecret) live outside git,
-// in secrets.properties:
-//   watchAddress=AA:BB:CC:DD:EE:FF
-//   watchSecret=...
-val secrets = Properties().apply {
-    val f = rootProject.file("secrets.properties")
+// Release signing is configured in signing.properties (not in git):
+//   storeFile=/path/to/release.jks
+//   storePassword=...
+//   keyAlias=...
+//   keyPassword=...
+val signing = Properties().apply {
+    val f = rootProject.file("signing.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
@@ -21,14 +22,24 @@ android {
         applicationId = "app.scanwatch"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
-        buildConfigField("String", "WATCH_SECRET", "\"${secrets.getProperty("watchSecret", "")}\"")
-        buildConfigField("String", "WATCH_ADDRESS", "\"${secrets.getProperty("watchAddress", "")}\"")
+        versionCode = 2
+        versionName = "0.2"
     }
 
-    buildFeatures {
-        buildConfig = true
+    signingConfigs {
+        if (signing.containsKey("storeFile")) create("release") {
+            storeFile = file(signing.getProperty("storeFile"))
+            storePassword = signing.getProperty("storePassword")
+            keyAlias = signing.getProperty("keyAlias")
+            keyPassword = signing.getProperty("keyPassword")
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
+        }
     }
 
     compileOptions {

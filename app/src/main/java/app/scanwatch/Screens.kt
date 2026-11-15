@@ -7,16 +7,17 @@ import java.time.LocalDate
 import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
-private val DAY_FMT = DateTimeFormatter.ofPattern("EEE d MMM")
+internal val DAY_FMT = DateTimeFormatter.ofPattern("EEE d MMM")
 private val HHMM = DateTimeFormatter.ofPattern("HH:mm")
-private val MONTH_SHORT = DateTimeFormatter.ofPattern("MMM")
+internal val MONTH_SHORT = DateTimeFormatter.ofPattern("MMM")
 
-private fun hhmm(t: Long, zone: ZoneId) = Instant.ofEpochSecond(t).atZone(zone).format(HHMM)
+internal fun hhmm(t: Long, zone: ZoneId) = Instant.ofEpochSecond(t).atZone(zone).format(HHMM)
 
 /** Bar labels: every weekday for a week, every 5th day for a month, months for a year. */
 private fun dayLabel(p: Period, d: LocalDate): String? = when (p.range) {
@@ -25,11 +26,53 @@ private fun dayLabel(p: Period, d: LocalDate): String? = when (p.range) {
 }
 
 /** All day buckets of a week/month, including future days (drawn empty). */
-private fun allDays(p: Period) = generateSequence(p.start) { it.plusDays(1) }.takeWhile { it < p.end }.toList()
-private fun months(p: Period) = (0 until 12).map { YearMonth.of(p.start.year, it + 1) }
+internal fun allDays(p: Period) = generateSequence(p.start) { it.plusDays(1) }.takeWhile { it < p.end }.toList()
+internal fun months(p: Period) = (0 until 12).map { YearMonth.of(p.start.year, it + 1) }
+
+/** Whether a rise is good (green), bad (red) or neither (grey). */
+enum class Better { HIGHER, LOWER, NEITHER }
+
+/**
+ * Rows comparing [value] for [p] with the period before and the same period a year earlier,
+ * e.g. "vs week before   ▲ 512 · 6%". Periods without data are skipped.
+ */
+fun MainActivity.comparison(p: Period, value: (Period) -> Double?, delta: (Double) -> String, better: Better): LinearLayout {
+    val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(4), 0, dp(8)) }
+    val cur = value(p) ?: return box
+    val others = buildList {
+        add(p.prevLabel to p.shift(-1))
+        if (p.range != Range.YEAR) add(p.yearAgoLabel to p.yearAgo())
+    }
+    for ((name, other) in others) {
+        val o = value(other)?.takeIf { it != 0.0 } ?: continue
+        val d = cur - o
+        val up = d > 0
+        val color = when {
+            abs(d) < 1e-9 || better == Better.NEITHER -> Pal.SUB
+            (better == Better.HIGHER) == up -> Pal.STEPS
+            else -> Pal.HR
+        }
+        val arrow = if (abs(d) < 1e-9) "=" else if (up) "▲" else "▼"
+        box.addView(hrow().apply {
+            setPadding(0, dp(3), 0, dp(3))
+            addView(label(name, 14f, Pal.SUB), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(label("$arrow ${delta(abs(d))} · ${(abs(d) / abs(o) * 100).roundToInt()}%", 14f, color, MEDIUM))
+        })
+    }
+    return box
+}
 
 class ActivityScreen(private val a: MainActivity, private val db: Db) {
     private val goal = 10_000
+
+    /** Steps for a day, or the average per day (over days with data) for longer periods. */
+    private fun steps(p: Period): Double? {
+        val data = db.days(p.start, p.end).values.filter { it.steps > 0 && it.day <= LocalDate.now() }
+        return if (data.isEmpty()) null else data.sumOf { it.steps }.toDouble() / data.size
+    }
+
+    private fun compare(p: Period) =
+        a.comparison(p, ::steps, { "%,d".format(it.roundToInt()) }, Better.HIGHER)
 
     fun build(p: Period, out: LinearLayout) = when (p.range) {
         Range.DAY -> day(p.start, out)
@@ -48,6 +91,7 @@ class ActivityScreen(private val a: MainActivity, private val db: Db) {
                 addView(a.tile("${(day?.kcal ?: 0.0).roundToInt()} kcal", "Active calories"))
                 addView(a.tile("${(steps * 100 / goal)}%", "Of goal", Pal.STEPS))
             })
+            addView(compare(Period.of(Range.DAY, d)).apply { setPadding(0, a.dp(14), 0, 0) })
         })
 
         val hours = db.hourlySteps(d)
@@ -81,8 +125,8 @@ class ActivityScreen(private val a: MainActivity, private val db: Db) {
         out.addView(a.card().apply {
             addView(a.label("Daily average", 13f, Pal.SUB, MEDIUM))
             addView(a.metric(avg.grouped(), "steps"))
-            addView(a.label("${past.sumOf { it.steps }.grouped()} steps · %.1f km in total".format(past.sumOf { it.dist } / 1000), 14f, Pal.SUB)
-                .apply { setPadding(0, 0, 0, a.dp(12)) })
+            addView(a.label("${past.sumOf { it.steps }.grouped()} steps · %.1f km in total".format(past.sumOf { it.dist } / 1000), 14f, Pal.SUB))
+            addView(compare(p))
             val days = allDays(p)
             addView(BarChart(a, days.map { d ->
                 val s = data[d]?.steps ?: 0
@@ -105,8 +149,8 @@ class ActivityScreen(private val a: MainActivity, private val db: Db) {
         out.addView(a.card().apply {
             addView(a.label("Daily average", 13f, Pal.SUB, MEDIUM))
             addView(a.metric(avg.grouped(), "steps"))
-            addView(a.label("${data.sumOf { it.steps }.grouped()} steps · %,.0f km in total".format(data.sumOf { it.dist } / 1000), 14f, Pal.SUB)
-                .apply { setPadding(0, 0, 0, a.dp(12)) })
+            addView(a.label("${data.sumOf { it.steps }.grouped()} steps · %,.0f km in total".format(data.sumOf { it.dist } / 1000), 14f, Pal.SUB))
+            addView(compare(p))
             val months = months(p)
             addView(BarChart(a, months.map { m ->
                 val days = byMonth[m].orEmpty()
@@ -146,6 +190,7 @@ class SleepScreen(private val a: MainActivity, private val db: Db) {
             addView(a.label("Time asleep", 13f, Pal.SUB, MEDIUM))
             addView(a.metric(hm(n.asleep), ""))
             addView(a.label("${hhmm(n.start, db.zone)} → ${hhmm(n.end, db.zone)} · ${hm(inBed)} in bed", 14f, Pal.SUB))
+            addView(compare(Period.of(Range.DAY, d)))
             val stages = db.stages(n.start - 1800, n.end + 60)
             if (stages.isNotEmpty()) addView(Hypnogram(a, stages, db.zone).apply { setPadding(0, a.dp(16), 0, 0) },
                 LinearLayout.LayoutParams(-1, -2).apply { topMargin = a.dp(14) })
@@ -174,7 +219,7 @@ class SleepScreen(private val a: MainActivity, private val db: Db) {
     private fun span(p: Period, out: LinearLayout) {
         val nights = db.mainNights(p.start, p.end)
         val list = nights.values.toList()
-        summaryCard(out, list, "Average per night") {
+        summaryCard(out, p, list, "Average per night") {
             val days = allDays(p)
             addView(BarChart(a, days.map { d ->
                 val n = nights[d]
@@ -188,7 +233,7 @@ class SleepScreen(private val a: MainActivity, private val db: Db) {
         val nights = db.mainNights(p.start, p.end)
         val byMonth = nights.entries.groupBy({ YearMonth.from(it.key) }, { it.value })
         val list = nights.values.toList()
-        summaryCard(out, list, "Average per night") {
+        summaryCard(out, p, list, "Average per night") {
             val months = months(p)
             addView(BarChart(a, months.map { m ->
                 val ns = byMonth[m].orEmpty()
@@ -200,7 +245,13 @@ class SleepScreen(private val a: MainActivity, private val db: Db) {
         stageCard(out, list)
     }
 
-    private fun summaryCard(out: LinearLayout, list: List<Night>, title: String, chart: LinearLayout.() -> Unit) {
+    /** Average time asleep (seconds) of the main nights in a period. */
+    private fun asleep(p: Period): Double? =
+        db.mainNights(p.start, p.end).values.takeIf { it.isNotEmpty() }?.let { l -> l.sumOf { it.asleep }.toDouble() / l.size }
+
+    private fun compare(p: Period) = a.comparison(p, ::asleep, { hm(it.roundToInt()) }, Better.HIGHER)
+
+    private fun summaryCard(out: LinearLayout, p: Period, list: List<Night>, title: String, chart: LinearLayout.() -> Unit) {
         out.addView(a.card().apply {
             addView(a.label(title, 13f, Pal.SUB, MEDIUM))
             if (list.isEmpty()) {
@@ -208,7 +259,8 @@ class SleepScreen(private val a: MainActivity, private val db: Db) {
             } else {
                 addView(a.metric(hm(list.sumOf { it.asleep } / list.size), ""))
                 addView(a.label("Bedtime ${avgClock(list.map { it.start })} · Wake-up ${avgClock(list.map { it.end })} · ${list.size} nights",
-                    14f, Pal.SUB).apply { setPadding(0, 0, 0, a.dp(12)) })
+                    14f, Pal.SUB))
+                addView(compare(p))
             }
             chart()
             addView(legend())
@@ -256,54 +308,3 @@ class SleepScreen(private val a: MainActivity, private val db: Db) {
     }
 }
 
-class VitalsScreen(private val a: MainActivity, private val db: Db) {
-    private class Metric(val title: String, val table: String, val col: String, val unit: String, val color: Int, val decimals: Int)
-
-    private val metrics = listOf(
-        Metric("Heart rate", "hr", "bpm", "bpm", Pal.HR, 0),
-        Metric("Heart rate variability (RMSSD)", "hrv", "rmssd", "ms", Pal.HRV, 0),
-        Metric("Body temperature", "temp", "c", "°C", Pal.TEMP, 2),
-        Metric("Respiratory rate", "rr", "rr", "/min", Pal.RR, 0),
-        Metric("Blood oxygen (SpO2)", "spo2", "pct", "%", Pal.SPO2, 0),
-    )
-
-    fun build(p: Period, out: LinearLayout) {
-        for (m in metrics) out.addView(a.card(m.title).apply { if (p.range == Range.DAY) day(m, p, this) else span(m, p, this) })
-    }
-
-    private fun fmt(m: Metric, v: Double) = "%.${m.decimals}f".format(v)
-
-    private fun day(m: Metric, p: Period, c: LinearLayout) {
-        val from = db.epoch(p.start)
-        val to = db.epoch(p.end)
-        val pts = db.points(m.table, m.col, from, to)
-        if (pts.isEmpty()) { c.addView(a.label("No data", 14f, Pal.SUB)); return }
-        val last = pts.last()
-        c.addView(a.metric(fmt(m, pts.sumOf { it.v } / pts.size), m.unit, 32f))
-        c.addView(a.label("Average · range ${fmt(m, pts.minOf { it.v })}–${fmt(m, pts.maxOf { it.v })} · last ${fmt(m, last.v)} at ${hhmm(last.t, db.zone)}",
-            14f, Pal.SUB).apply { setPadding(0, 0, 0, a.dp(10)) })
-        val ticks = (0..24 step 6).map { h -> from + h * 3600L to "%02d".format(h % 24) }
-        c.addView(LineChart(a, pts, m.color, from, to, ticks, { "${hhmm(it.t, db.zone)} · ${fmt(m, it.v)} ${m.unit}" }))
-    }
-
-    private fun span(m: Metric, p: Period, c: LinearLayout) {
-        val bands = db.bands(m.table, m.col, p.start, p.end)
-        if (bands.isEmpty()) { c.addView(a.label("No data", 14f, Pal.SUB)); return }
-        val noon = { d: LocalDate -> db.epoch(d) + 43200 }
-        c.addView(a.metric(fmt(m, bands.sumOf { it.avg } / bands.size), m.unit, 32f))
-        c.addView(a.label("Average · range ${fmt(m, bands.minOf { it.min })}–${fmt(m, bands.maxOf { it.max })}", 14f, Pal.SUB)
-            .apply { setPadding(0, 0, 0, a.dp(10)) })
-        val ticks = when (p.range) {
-            Range.WEEK -> allDays(p).map { noon(it) to it.dayOfWeek.name.take(2).lowercase().replaceFirstChar { c -> c.uppercaseChar() } }
-            Range.MONTH -> allDays(p).filter { it.dayOfMonth == 1 || it.dayOfMonth % 5 == 0 }.map { noon(it) to it.dayOfMonth.toString() }
-            else -> months(p).map { db.epoch(it.atDay(15)) to it.format(MONTH_SHORT).take(1) }
-        }
-        val byT = bands.associateBy { noon(it.day) }
-        c.addView(LineChart(
-            a, bands.map { Point(noon(it.day), it.avg) }, m.color, db.epoch(p.start), db.epoch(p.end), ticks,
-            { pt -> byT[pt.t]!!.let { "${it.day.format(DAY_FMT)} · ${fmt(m, it.avg)} (${fmt(m, it.min)}–${fmt(m, it.max)})" } },
-            bands = if (p.range == Range.YEAR) emptyList() else bands.map { Triple(noon(it.day), it.min, it.max) },
-            gap = 3 * 86400L,
-        ))
-    }
-}

@@ -32,6 +32,21 @@ data class Period(val range: Range, val start: LocalDate) {
 
     val hasNext get() = end <= LocalDate.now()
 
+    val containsToday get() = LocalDate.now().let { it >= start && it < end }
+
+    /** The most recent day of the period that isn't in the future. */
+    val latestDay: LocalDate get() = minOf(end.minusDays(1), LocalDate.now())
+
+    /** The same period one year earlier (for weeks: the week containing the same date). */
+    fun yearAgo() = of(range, start.minusYears(1))
+
+    val prevLabel get() = when (range) {
+        Range.DAY -> "vs day before"; Range.WEEK -> "vs week before"; Range.MONTH -> "vs month before"; Range.YEAR -> "vs year before"
+    }
+    val yearAgoLabel get() = when (range) {
+        Range.DAY -> "vs same day last year"; Range.WEEK -> "vs same week last year"; Range.MONTH -> "vs same month last year"; Range.YEAR -> ""
+    }
+
     fun title(): String {
         val today = LocalDate.now()
         val yr = if (start.year != today.year) " ${start.year}" else ""

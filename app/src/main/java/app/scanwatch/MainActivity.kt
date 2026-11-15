@@ -2,6 +2,9 @@ package app.scanwatch
 
 import android.Manifest
 import android.app.Activity
+import android.app.DatePickerDialog
+import android.view.View
+import android.widget.EditText
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -30,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var scroll: ScrollView
     private lateinit var nav: LinearLayout
     private lateinit var syncPill: TextView
+    private lateinit var todayPill: TextView
     private val main = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("meta", MODE_PRIVATE) }
 
@@ -57,9 +61,15 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(8), dp(16), dp(8))
             setOnClickListener { startSync() }
         }
+        todayPill = label("Today", 14f, Pal.TEXT, MEDIUM).apply {
+            background = rounded(Pal.CHIP, dpf(16))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            setOnClickListener { open(Period.of(period.range, LocalDate.now())) }
+        }
         val header = hrow().apply {
             setPadding(dp(20), dp(8), dp(16), dp(4))
-            addView(label("ScanWatch", 22f, Pal.TEXT, BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(label("MitWit", 22f, Pal.TEXT, BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(todayPill, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) })
             addView(syncPill)
         }
         body = LinearLayout(this).apply {
@@ -81,7 +91,9 @@ class MainActivity : Activity() {
         setContentView(root)
         render()
 
-        // Test hooks: `--ez sync true` starts a sync, `--es import <path>` imports an export zip.
+        // adb hooks: `--es secret <s>` saves the watch secret, `--ez sync true` starts a sync,
+        // `--es import <path>` imports an export zip.
+        intent.getStringExtra("secret")?.let { prefs.edit().putString("secret", it).commit() }
         if (intent.getBooleanExtra("sync", false)) startSync()
         intent.getStringExtra("import")?.let { path -> importFrom { File(path).inputStream() } }
     }
@@ -111,20 +123,37 @@ class MainActivity : Activity() {
         return super.dispatchTouchEvent(ev)
     }
 
+    /** Calendar picker; jumps to the period of the current range containing the picked day. */
+    private fun pickDate() {
+        val d = period.latestDay
+        DatePickerDialog(this, { _, y, m, day -> open(Period.of(period.range, LocalDate.of(y, m + 1, day))) },
+            d.year, d.monthValue - 1, d.dayOfMonth).apply {
+            datePicker.maxDate = System.currentTimeMillis()
+            show()
+        }
+    }
+
     private fun render() {
         renderNav()
+        todayPill.visibility = if (tab != Tab.WATCH && !period.containsToday) View.VISIBLE else View.GONE
         syncPill.text = busy ?: "Sync"
         syncPill.alpha = if (busy != null) 0.6f else 1f
         body.removeAllViews()
         if (tab == Tab.WATCH) return renderWatch()
 
+        // Switching range keeps the most recent day of the period being viewed, so Year → Day
+        // lands on today (or the last day of a past year), not on 1 January.
         body.addView(segmented(Range.entries.map { it.label }, period.range.ordinal) { i ->
-            open(Period.of(Range.entries[i], period.start.coerceAtMost(LocalDate.now())))
+            open(Period.of(Range.entries[i], period.latestDay))
         })
         body.addView(hrow().apply {
             setPadding(0, dp(6), 0, dp(6))
             addView(arrow("‹", true) { open(period.shift(-1)) })
-            addView(label(period.title(), 17f, Pal.TEXT, MEDIUM).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(label("${period.title()}  ▾", 17f, Pal.TEXT, MEDIUM).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, dp(10), 0, dp(10))
+                setOnClickListener { pickDate() }
+            }, LinearLayout.LayoutParams(0, -2, 1f))
             addView(arrow("›", period.hasNext) { open(period.shift(1)) })
         })
         when (tab) {
@@ -167,6 +196,28 @@ class MainActivity : Activity() {
                 if (battery != null) add("Battery $battery%")
             }.joinToString(" · "), 14f, Pal.SUB).apply { setPadding(0, dp(2), 0, dp(14)) })
             addView(button(busy ?: "Sync now", busy == null) { startSync() })
+        })
+        body.addView(card("Watch secret").apply {
+            val secret = prefs.getString("secret", "") ?: ""
+            addView(label(
+                if (secret.isEmpty()) "Paste the association secret for your watch. See the README for how to get it from a Bluetooth log."
+                else "Saved (…${secret.takeLast(4)}). It's used to recognise and log in to your watch.",
+                14f, Pal.SUB,
+            ).apply { setPadding(0, 0, 0, dp(12)) })
+            val input = EditText(context).apply {
+                hint = "Secret"
+                setTextColor(Pal.TEXT)
+                setHintTextColor(Pal.SUB)
+                isSingleLine = true
+                background = rounded(Pal.CHIP, dpf(12))
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            }
+            addView(input, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+            addView(button("Save secret", true) {
+                prefs.edit().putString("secret", input.text.toString().trim()).apply()
+                render()
+            })
         })
         body.addView(card("Import Withings data").apply {
             addView(label("Pick the data_….zip export from Withings (Settings → Download my data). Re-importing is safe.", 14f, Pal.SUB)
@@ -228,7 +279,7 @@ class MainActivity : Activity() {
         }
         background("Syncing…") {
             Sync(WatchClient(this, ::log), db, { k, v -> prefs.edit().putString(k, v).apply() }, ::log)
-                .run(BuildConfig.WATCH_ADDRESS, BuildConfig.WATCH_SECRET)
+                .run(prefs.getString("secret", "") ?: "")
         }
     }
 
